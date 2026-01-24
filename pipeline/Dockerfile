@@ -1,5 +1,5 @@
 # Base image with Python
-FROM python:3.13-slim
+FROM python:3.13.11-slim
 
 # Set working directory inside container
 WORKDIR /code
@@ -11,4 +11,4 @@ COPY pipeline.py .
 RUN pip install --no-cache-dir pandas pyarrow
 
 # Default command to run the script
-CMD ["python", "pipeline.py"]
+ENTRYPOINT ["python", "pipeline.py"]
