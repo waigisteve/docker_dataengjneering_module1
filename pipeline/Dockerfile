@@ -1,16 +1,23 @@
 # Base image with Python
 FROM python:3.13.11-slim
 
+# Copy uv binary
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/
-# Set working directory inside container
-COPY pyproject.toml .python-version uv.lock ./
+
+# Set working directory
 WORKDIR /code
 
-# Copy the Python script into the container
-COPY pipeline/pipeline.py .
+# Ensure uv virtualenv is used
+ENV PATH="/code/.venv/bin:$PATH"
 
-# Install required packages
-# RUN pip install --no-cache-dir pandas pyarrow
+# Copy dependency files first (for Docker layer caching)
+COPY pyproject.toml .python-version uv.lock ./
 
-# Default command to run the script
-# ENTRYPOINT ["python", "pipeline.py"]
+# Install dependencies using uv
+RUN uv sync --frozen --no-dev
+
+# Copy application code
+COPY pipeline.py .
+
+# Run the pipeline
+ENTRYPOINT ["python", "pipeline.py"]
