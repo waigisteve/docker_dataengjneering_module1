@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   ny_taxi_pg:
     image: postgres:18
@@ -9,7 +11,13 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ny_taxi_data:/var/lib/postgresql/data
+      - ny_taxi_data:/var/lib/postgresql
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d ny_taxi"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   data_pipeline:
     build:
@@ -17,12 +25,16 @@ services:
       dockerfile: Dockerfile
     depends_on:
       ny_taxi_pg:
-        condition: service_started
+        condition: service_healthy
     environment:
       POSTGRES_HOST: ny_taxi_pg
       POSTGRES_USER: root
       POSTGRES_PASSWORD: root
       POSTGRES_DB: ny_taxi
+    volumes:
+      - ./pipeline:/app               # Host pipeline folder
+      - ./pipeline/processed:/app/processed  # Persist processed files
+    restart: always
 
 volumes:
   ny_taxi_data:
