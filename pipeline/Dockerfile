@@ -1,19 +1,31 @@
 # Base image
-FROM python:3.13.11-slim
+FROM python:3.13-slim
 
-# Set working directory inside container
+# Working directory
 WORKDIR /app
 
-# Install system dependencies and Python packages
-RUN apt-get update && apt-get install -y gcc libpq-dev && \
-    pip install --no-cache-dir pandas sqlalchemy pyarrow psycopg2-binary && \
-    rm -rf /var/lib/apt/lists/*
+# System dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy the pipeline script
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.cargo/bin:$PATH"
+
+# Copy dependency metadata FIRST (Docker cache optimization)
+COPY pyproject.toml uv.lock ./
+
+# Install dependencies via uv (locked + reproducible)
+RUN uv sync --frozen
+
+# Copy application code
 COPY load_parquet_to_postgres.py /app/
 
-# Ensure processed folder exists (runtime will persist if mounted)
+# Ensure processed folder exists
 RUN mkdir -p /app/processed
 
-# Default command to run the pipeline script
-ENTRYPOINT ["python3", "-u", "load_parquet_to_postgres.py"]
+# Default command
+ENTRYPOINT ["python", "-u", "load_parquet_to_postgres.py"]

@@ -1,10 +1,15 @@
 [project]
 name = "pipeline"
 version = "0.1.0"
-description = "Add your description here"
+description = "Parquet-to-Postgres streaming pipeline"
 readme = "README.md"
 requires-python = ">=3.12"
+
 dependencies = [
     "pandas>=3.0.0",
     "pyarrow>=23.0.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary>=2.9.9",
+    "pgcli>=4.0.0",
+    "jupyterlab>=4.0.0",
 ]
