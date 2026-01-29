@@ -4,10 +4,12 @@ services:
   ny_taxi_pg:
     image: postgres:18
     container_name: ny_taxi_pg
+    env_file:
+      - .env
     environment:
-      POSTGRES_USER: root
-      POSTGRES_PASSWORD: root
-      POSTGRES_DB: ny_taxi
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
@@ -26,11 +28,13 @@ services:
     depends_on:
       ny_taxi_pg:
         condition: service_healthy
+    env_file:
+    - .env
     environment:
-      POSTGRES_HOST: ny_taxi_pg
-      POSTGRES_USER: root
-      POSTGRES_PASSWORD: root
-      POSTGRES_DB: ny_taxi
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - ./pipeline:/app               # Host pipeline folder
       - ./pipeline/processed:/app/processed  # Persist processed files
