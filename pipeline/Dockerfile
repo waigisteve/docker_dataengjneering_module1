@@ -1,31 +1,31 @@
-# Base image
-FROM python:3.13-slim
+FROM python:3.13.11-slim
 
-# Working directory
 WORKDIR /app
 
-# System dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    gcc \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get install -y gcc libpq-dev curl && \
+    rm -rf /var/lib/apt/lists/*
 
-# Install uv
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.cargo/bin:$PATH"
+# Install Python packages
+RUN pip install --no-cache-dir \
+    pandas \
+    sqlalchemy \
+    pyarrow \
+    psycopg2-binary \
+    pgcli \
+    notebook
 
-# Copy dependency metadata FIRST (Docker cache optimization)
+# Optionally install UV
+# RUN curl -LsSf https://raw.githubusercontent.com/astral-sh/uv/main/install.py | python3 -
+
 COPY pyproject.toml uv.lock ./
 
-# Install dependencies via uv (locked + reproducible)
-RUN uv sync --frozen
-
-# Copy application code
+# Copy pipeline scripts
 COPY load_parquet_to_postgres.py /app/
 
 # Ensure processed folder exists
 RUN mkdir -p /app/processed
 
-# Default command
-ENTRYPOINT ["python", "-u", "load_parquet_to_postgres.py"]
+EXPOSE 8888
+
+ENTRYPOINT ["python3", "-u", "load_parquet_to_postgres.py"]
