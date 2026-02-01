@@ -13,7 +13,8 @@ RUN pip install --no-cache-dir \
     pyarrow \
     psycopg2-binary \
     pgcli \
-    notebook
+    notebook\
+    ipykernel
 
 # Optionally install UV
 # RUN curl -LsSf https://raw.githubusercontent.com/astral-sh/uv/main/install.py | python3 -
