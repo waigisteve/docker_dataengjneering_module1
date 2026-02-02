@@ -12,4 +12,6 @@ dependencies = [
     "psycopg2-binary>=2.9.9",
     "pgcli>=4.0.0",
     "jupyterlab>=4.0.0",
+    "ipykernel>=6.29.0",
+    "jupyterlab-git>=0.51.0"
 ]
