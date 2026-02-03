@@ -1,4 +1,5 @@
-# docker-compose.yml
+version: "3.9"
+
 services:
   ny_taxi_pg:
     image: postgres:18
@@ -20,17 +21,49 @@ services:
     build:
       context: ./pipeline
       dockerfile: Dockerfile
+    container_name: data_pipeline
     depends_on:
       ny_taxi_pg:
         condition: service_healthy
     env_file:
       - .env
-    ports:
-      - "8888:8888" 
+    environment:
+      - UV_PROJECT_ENVIRONMENT=/opt/venv
+      - UV_PYTHON_PREFERENCE=only-system
     volumes:
       - ./pipeline:/app
       - ./pipeline/processed:/app/processed
     restart: always
+    command: >
+      bash -c "
+      cd /app &&
+      uv sync || --frozen &&
+      uv run python -u load_parquet_to_postgres.py
+      "
+
+  jupyter:
+    build:
+      context: ./pipeline
+      dockerfile: Dockerfile
+    container_name: data_pipeline_jupyter
+    env_file:
+      - .env
+    environment:
+      - UV_PROJECT_ENVIRONMENT=/opt/venv
+      - UV_PYTHON_PREFERENCE=only-system  
+    volumes:
+      - ./pipeline:/app
+    depends_on:
+      ny_taxi_pg:
+        condition: service_healthy
+    ports:
+      - "8888:8888"
+    command: >
+      bash -c "
+      cd /app &&
+      uv sync || --frozen &&
+      uv run jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root
+      "
 
 volumes:
   ny_taxi_data:

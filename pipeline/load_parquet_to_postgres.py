@@ -3,6 +3,9 @@ import time
 import glob
 import shutil
 import pandas as pd
+import threading
+import http.server
+import socketserver
 from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -42,47 +45,60 @@ def wait_for_postgres(max_retries=60, retry_interval=2):
 engine = wait_for_postgres()
 inspector = inspect(engine)
 
-# --- WATCH LOOP ---
+# --- WATCH LOOP FUNCTION ---
 POLL_INTERVAL = 5  # seconds
-print(f"Watching folder {WATCH_FOLDER} for Parquet files...", flush=True)
 
-try:
-    while True:
-        parquet_files = glob.glob(os.path.join(WATCH_FOLDER, "*.parquet"))
-        for parquet_file in parquet_files:
-            file_name = os.path.basename(parquet_file)
-            processed_path = os.path.join(PROCESSED_FOLDER, file_name)
+def etl_loop():
+    print(f"Watching folder {WATCH_FOLDER} for Parquet files...", flush=True)
+    try:
+        while True:
+            parquet_files = glob.glob(os.path.join(WATCH_FOLDER, "*.parquet"))
+            for parquet_file in parquet_files:
+                file_name = os.path.basename(parquet_file)
+                processed_path = os.path.join(PROCESSED_FOLDER, file_name)
 
-            if os.path.exists(processed_path):
-                continue
+                if os.path.exists(processed_path):
+                    continue
 
-            print(f"Loading Parquet file: {parquet_file}", flush=True)
-            try:
-                df = pd.read_parquet(parquet_file, engine='pyarrow')
-                print(f"Loaded {len(df)} rows from {file_name}", flush=True)
-            except Exception as e:
-                print(f"Error reading {file_name}: {e}", flush=True)
-                continue
+                print(f"Loading Parquet file: {parquet_file}", flush=True)
+                try:
+                    df = pd.read_parquet(parquet_file, engine='pyarrow')
+                    print(f"Loaded {len(df)} rows from {file_name}", flush=True)
+                except Exception as e:
+                    print(f"Error reading {file_name}: {e}", flush=True)
+                    continue
 
-            # --- FILTER COLUMNS THAT EXIST IN TABLE ---
-            if inspector.has_table(TABLE_NAME):
-                table_columns = [col['name'] for col in inspector.get_columns(TABLE_NAME)]
-                df = df[[c for c in df.columns if c in table_columns]]
-                print(f"Columns after filtering to match table: {df.columns.tolist()}", flush=True)
+                # --- FILTER COLUMNS THAT EXIST IN TABLE ---
+                if inspector.has_table(TABLE_NAME):
+                    table_columns = [col['name'] for col in inspector.get_columns(TABLE_NAME)]
+                    df = df[[c for c in df.columns if c in table_columns]]
+                    print(f"Columns after filtering to match table: {df.columns.tolist()}", flush=True)
 
-            # --- WRITE TO POSTGRES ---
-            try:
-                df.to_sql(TABLE_NAME, engine, if_exists='append', index=False, chunksize=1000)
-                print(f"Inserted {len(df)} rows into {TABLE_NAME}", flush=True)
-                shutil.move(parquet_file, processed_path)
-                print(f"Moved {file_name} to processed folder", flush=True)
-            except SQLAlchemyError as e:
-                print(f"Error inserting into Postgres: {e}", flush=True)
+                # --- WRITE TO POSTGRES ---
+                try:
+                    df.to_sql(TABLE_NAME, engine, if_exists='append', index=False, chunksize=1000)
+                    print(f"Inserted {len(df)} rows into {TABLE_NAME}", flush=True)
+                    shutil.move(parquet_file, processed_path)
+                    print(f"Moved {file_name} to processed folder", flush=True)
+                except SQLAlchemyError as e:
+                    print(f"Error inserting into Postgres: {e}", flush=True)
 
-        time.sleep(POLL_INTERVAL)
+            time.sleep(POLL_INTERVAL)
 
-except KeyboardInterrupt:
-    print("Pipeline stopped by user", flush=True)
-finally:
-    if engine:
-        engine.dispose()
+    except KeyboardInterrupt:
+        print("Pipeline stopped by user", flush=True)
+    finally:
+        if engine:
+            engine.dispose()
+
+
+# --- START ETL IN BACKGROUND THREAD ---
+threading.Thread(target=etl_loop, daemon=True).start()
+
+
+# --- MINIMAL HTTP SERVER FOR PORT FORWARDING ---
+PORT = 8888
+Handler = http.server.SimpleHTTPRequestHandler
+with socketserver.TCPServer(("", PORT), Handler) as httpd:
+    print(f"Pipeline container listening on port {PORT} (for host access)", flush=True)
+    httpd.serve_forever()

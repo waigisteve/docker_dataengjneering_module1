@@ -1,32 +1,20 @@
-FROM python:3.13.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y gcc libpq-dev curl && \
+    apt-get install -y bash gcc libpq-dev curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python packages
-RUN pip install --no-cache-dir \
-    pandas \
-    sqlalchemy \
-    pyarrow \
-    psycopg2-binary \
-    pgcli \
-    notebook\
-    ipykernel
-
-# Optionally install UV
-# RUN curl -LsSf https://raw.githubusercontent.com/astral-sh/uv/main/install.py | python3 -
+# Install uv (reliable path inside Docker)
+RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock ./
 
-# Copy pipeline scripts
-COPY load_parquet_to_postgres.py /app/
+RUN uv sync --frozen
 
-# Ensure processed folder exists
+COPY load_parquet_to_postgres.py /app/
 RUN mkdir -p /app/processed
 
 EXPOSE 8888
-
-ENTRYPOINT ["python3", "-u", "load_parquet_to_postgres.py"]
+CMD ["bash"]
