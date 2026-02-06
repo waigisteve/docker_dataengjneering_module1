@@ -8,6 +8,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from io import StringIO
 from typing import List, Optional, Tuple
 
@@ -41,6 +42,7 @@ class JobConfig:
     int_like_cols: Tuple[str, ...]
     date_cols: Tuple[str, ...]
     dtype_overrides: dict
+    month_ym: Optional[str] = None  # YYYY-MM for partition creation (batch mode)
 
 
 # =========================
@@ -51,9 +53,9 @@ def setup_logger(log_file: str, verbose: bool) -> logging.Logger:
     logger = logging.getLogger("etl")
     logger.setLevel(logging.DEBUG)
 
-    # If rerun with a different log file, clear handlers
+    # Prevent duplicate handlers across reruns
     if logger.handlers:
-        logger.handlers.clear()
+        return logger
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
@@ -72,7 +74,7 @@ def setup_logger(log_file: str, verbose: bool) -> logging.Logger:
 
 def load_env_file(path: str) -> None:
     """
-    Minimal .env loader:
+    Minimal .env loader (no external dependency):
       - ignores blanks and comments
       - supports KEY=VALUE
       - does NOT overwrite existing env vars
@@ -99,6 +101,12 @@ def load_env_file(path: str) -> None:
 # =========================
 
 def read_db_config(env_required: bool, args: argparse.Namespace) -> DBConfig:
+    """
+    Precedence:
+      1) CLI args (if provided)
+      2) env vars (possibly loaded from --env-file)
+      3) safe defaults if env_required=False
+    """
     host = args.pg_host or os.environ.get("POSTGRES_HOST") or ("localhost" if not env_required else None)
     port_raw = args.pg_port or os.environ.get("POSTGRES_PORT") or ("5432" if not env_required else None)
     user = args.pg_user or os.environ.get("POSTGRES_USER") or ("root" if not env_required else None)
@@ -218,21 +226,76 @@ def table_columns(engine, table_name: str) -> List[str]:
     return cols
 
 
-def ensure_target_table(engine, table_name: str, first_chunk: pd.DataFrame, date_cols: Tuple[str, ...]) -> None:
+# =========================
+# Partitioning helpers
+# =========================
+
+def _ym_to_bounds(ym: str) -> tuple[str, str]:
     """
-    Create the target table *once* with proper TIMESTAMP columns from the start.
-    Avoids ALTER COLUMN casting failures.
+    ym = 'YYYY-MM' -> ('YYYY-MM-01 00:00:00', next_month_start)
+    (no timezone; matches Postgres TIMESTAMP)
+    """
+    y, m = map(int, ym.split("-"))
+    start = datetime(y, m, 1, 0, 0, 0)
+    if m == 12:
+        end = datetime(y + 1, 1, 1, 0, 0, 0)
+    else:
+        end = datetime(y, m + 1, 1, 0, 0, 0)
+    return start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _partition_name(table_name: str, ym: str) -> str:
+    y, m = ym.split("-")
+    return f'{table_name}_p{y}_{m}'
+
+
+def ensure_default_partition(engine, table_name: str) -> None:
+    default_part = f'{table_name}_p_default'
+    with engine.begin() as conn:
+        conn.execute(text(f'''
+            DO $$
+            BEGIN
+              IF to_regclass('public."{default_part}"') IS NULL THEN
+                EXECUTE 'CREATE TABLE "{default_part}" PARTITION OF "{table_name}" DEFAULT';
+              END IF;
+            END$$;
+        '''))
+
+
+def ensure_partitioned_indexes(engine, table_name: str) -> None:
+    """
+    Partitioned indexes on parent apply to partitions.
+    Keep minimal; add more as needed.
+    """
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{table_name}_pickup_idx" ON "{table_name}" ("tpep_pickup_datetime")'))
+        conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{table_name}_puloc_idx"  ON "{table_name}" ("PULocationID")'))
+        conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{table_name}_doloc_idx"  ON "{table_name}" ("DOLocationID")'))
+
+
+def create_partitioned_parent(engine, table_name: str, first_chunk: pd.DataFrame, date_cols: Tuple[str, ...]) -> None:
+    """
+    Create a partitioned parent table once, with TIMESTAMP columns set at creation time.
+    Strategy:
+      1) Create a normal empty table via pandas to_sql (ensures types)
+      2) Rename it
+      3) Create partitioned parent LIKE old_table
+      4) Drop old empty table
+      5) Create default partition + indexes
     """
     if table_exists(engine, table_name):
         return
 
     df0 = first_chunk.copy()
+
+    # Ensure datetime parsing so schema aligns to TIMESTAMP
     for c in date_cols:
         if c in df0.columns:
             df0[c] = pd.to_datetime(df0[c], errors="coerce")
 
     dtype_map = {c: DateTime() for c in date_cols if c in df0.columns}
 
+    # Step 1: create base normal table
     df0.head(0).to_sql(
         table_name,
         con=engine,
@@ -240,6 +303,102 @@ def ensure_target_table(engine, table_name: str, first_chunk: pd.DataFrame, date
         index=False,
         dtype=dtype_map,
     )
+
+    base = f"{table_name}__base"
+    with engine.begin() as conn:
+        # Step 2: rename base table
+        conn.execute(text(f'ALTER TABLE "{table_name}" RENAME TO "{base}"'))
+
+        # Step 3: create partitioned parent LIKE base
+        conn.execute(text(f'''
+            CREATE TABLE "{table_name}" (
+              LIKE "{base}" INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING GENERATED INCLUDING IDENTITY
+            )
+            PARTITION BY RANGE ("tpep_pickup_datetime");
+        '''))
+
+        # Step 4: drop the empty base table
+        conn.execute(text(f'DROP TABLE "{base}"'))
+
+    # Step 5: default partition + indexes
+    ensure_default_partition(engine, table_name)
+    ensure_partitioned_indexes(engine, table_name)
+
+
+def ensure_target_table(engine, table_name: str, first_chunk: pd.DataFrame, date_cols: Tuple[str, ...]) -> None:
+    """
+    Ensure the partitioned target table exists.
+    """
+    if table_exists(engine, table_name):
+        ensure_default_partition(engine, table_name)
+        return
+    create_partitioned_parent(engine, table_name, first_chunk, date_cols)
+
+
+def ensure_month_partition(engine, table_name: str, ym: str) -> None:
+    """
+    OPTION 2 (safe when DEFAULT already has rows):
+      1) Create a standalone month table LIKE parent
+      2) Move matching rows from DEFAULT into it
+      3) Delete moved rows from DEFAULT
+      4) Attach as a real partition
+
+    Prevents: "updated partition constraint for default partition would be violated"
+    """
+    part = _partition_name(table_name, ym)
+    default_part = f'{table_name}_p_default'
+
+    start_str, end_str = _ym_to_bounds(ym)
+    start_dt = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
+    end_dt = datetime.strptime(end_str, "%Y-%m-%d %H:%M:%S")
+
+    # Make sure DEFAULT exists first
+    ensure_default_partition(engine, table_name)
+
+    with engine.begin() as conn:
+        # If already exists, done
+        exists = conn.execute(
+            text("SELECT to_regclass(:reg)"),
+            {"reg": f'public."{part}"'}
+        ).scalar()
+        if exists is not None:
+            return
+
+        # 1) Create standalone table (NOT partition yet)
+        conn.execute(text(f'''
+            CREATE TABLE "{part}" (
+              LIKE "{table_name}" INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING GENERATED INCLUDING IDENTITY
+            );
+        '''))
+
+        # 2) Move rows from DEFAULT into standalone table
+        conn.execute(
+            text(f'''
+                INSERT INTO "{part}"
+                SELECT *
+                FROM ONLY "{default_part}"
+                WHERE "tpep_pickup_datetime" >= :start_ts
+                  AND "tpep_pickup_datetime" <  :end_ts
+            '''),
+            {"start_ts": start_dt, "end_ts": end_dt}
+        )
+
+        # 3) Delete moved rows from DEFAULT
+        conn.execute(
+            text(f'''
+                DELETE FROM ONLY "{default_part}"
+                WHERE "tpep_pickup_datetime" >= :start_ts
+                  AND "tpep_pickup_datetime" <  :end_ts
+            '''),
+            {"start_ts": start_dt, "end_ts": end_dt}
+        )
+
+        # 4) Attach as real partition
+        conn.execute(text(f'''
+            ALTER TABLE "{table_name}"
+            ATTACH PARTITION "{part}"
+            FOR VALUES FROM ('{start_str}') TO ('{end_str}');
+        '''))
 
 
 # =========================
@@ -330,8 +489,10 @@ def fetch_release_assets(repo: str, tag: str, session: Optional[requests.Session
 
 def discover_yellow_monthly_urls(repo: str, tag: str, start_month: Optional[str], end_month: Optional[str],
                                 logger: logging.Logger) -> List[Tuple[str, str, str]]:
+    """
+    Returns list of (csv_url, load_id, month_ym) sorted by month.
+    """
     assets = fetch_release_assets(repo=repo, tag=tag)
-
     picks: List[Tuple[str, str, str]] = []
     for a in assets:
         name = a.get("name", "")
@@ -369,7 +530,7 @@ def discover_yellow_monthly_urls(repo: str, tag: str, start_month: Optional[str]
 # =========================
 
 def run_load(db: DBConfig, cfg: JobConfig, logger: logging.Logger,
-             retries_per_chunk: int, retry_sleep_sec: float, skip_completed: bool) -> int:
+             retries_per_chunk: int, retry_sleep_sec: float) -> int:
     engine = make_engine(db)
     ensure_progress_table(engine)
 
@@ -385,17 +546,18 @@ def run_load(db: DBConfig, cfg: JobConfig, logger: logging.Logger,
             chunksize=cfg.chunk_size,
             low_memory=False,
             dtype=cfg.dtype_overrides,
-            skiprows=range(1, rows_loaded + 1),
+            skiprows=range(1, rows_loaded + 1),  # keep header, skip already loaded rows
         )
 
-        # Determine schema + COPY SQL
+        # If table doesn't exist, we must create partitioned parent from first chunk
         if not table_exists(engine, cfg.table_name):
-            first = next(df_iter)  # may raise StopIteration (empty file)
-            if first is None or first.empty:
-                logger.info("[done] file has no rows (first chunk empty)")
-                return 0
-
+            first = next(df_iter)  # may raise StopIteration
             ensure_target_table(engine, cfg.table_name, first, cfg.date_cols)
+
+            # In batch mode: precreate/attach month partition (safe option 2)
+            if cfg.month_ym:
+                ensure_month_partition(engine, cfg.table_name, cfg.month_ym)
+
             cols = table_columns(engine, cfg.table_name)
             copy_sql = make_copy_sql(cfg.table_name, cols)
 
@@ -409,17 +571,20 @@ def run_load(db: DBConfig, cfg: JobConfig, logger: logging.Logger,
             logger.info(f"[ok] copied chunk={chunks_loaded} rows_in_chunk={len(first)} total_rows={rows_loaded} sec={sec:.2f}")
 
         else:
+            # Table exists: for each job, ensure month partition exists (safe option 2)
+            if cfg.month_ym:
+                ensure_month_partition(engine, cfg.table_name, cfg.month_ym)
+
             cols = table_columns(engine, cfg.table_name)
             copy_sql = make_copy_sql(cfg.table_name, cols)
 
-        # Stream remaining chunks
-        saw_any = False
+        any_rows = False
         for df_chunk in tqdm(df_iter, desc="Loading"):
-            if df_chunk is None or df_chunk.empty:
-                # Don't copy, don't update progress, just skip
-                continue
+            if len(df_chunk) == 0:
+                logger.info("[done] reached end of file (empty chunk)")
+                break
 
-            saw_any = True
+            any_rows = True
             t0 = time.time()
             _copy_with_retry(pg_conn, copy_sql, cols, df_chunk, cfg, logger, retries_per_chunk, retry_sleep_sec)
             sec = time.time() - t0
@@ -429,16 +594,10 @@ def run_load(db: DBConfig, cfg: JobConfig, logger: logging.Logger,
             upsert_progress(engine, cfg, rows_loaded, chunks_loaded, error=None)
             logger.info(f"[ok] copied chunk={chunks_loaded} rows_in_chunk={len(df_chunk)} total_rows={rows_loaded} sec={sec:.2f}")
 
-        # If we resumed and immediately hit EOF (no chunks processed), treat as complete and continue batch.
-        if rows_loaded > 0 and not saw_any and skip_completed:
+        if not any_rows and rows_loaded > 0:
             logger.info("[done] appears complete already (no remaining chunks). Skipping.")
-            return 0
 
     except StopIteration:
-        # Happens when df_iter has no remaining data (common when month already complete)
-        if rows_loaded > 0 and skip_completed:
-            logger.info("[done] appears complete already (iterator empty). Skipping.")
-            return 0
         logger.info("[done] no data (iterator empty)")
 
     except Exception as e:
@@ -456,7 +615,7 @@ def run_load(db: DBConfig, cfg: JobConfig, logger: logging.Logger,
         except Exception:
             pass
 
-    # Final count (table-wide, not per load_id)
+    # Final count (optional, can be expensive)
     try:
         n = int(pd.read_sql(f'SELECT COUNT(*) AS n FROM "{cfg.table_name}"', con=engine).iloc[0, 0])
         logger.info(f"Row count: {n}")
@@ -490,11 +649,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chunk-size", type=int, default=50_000)
     p.add_argument("--retries-per-chunk", type=int, default=3)
     p.add_argument("--retry-sleep-sec", type=float, default=2.0)
-    p.add_argument("--skip-completed", action="store_true", default=True,
-                   help="Skip months that appear already fully ingested (default: true).")
 
     # single-file mode
-    p.add_argument("--csv-url", default=None, help="Single CSV URL to ingest")
+    p.add_argument("--csv-url", default=None, help="Single CSV URL to ingest (e.g. .../yellow_tripdata_2021-01.csv.gz)")
     p.add_argument("--load-id", default=None, help="Progress id (required for --csv-url unless inferred).")
 
     # batch-from-release mode
@@ -522,9 +679,11 @@ def main(argv: List[str]) -> int:
 
     logger = setup_logger(log_file=args.log_file, verbose=args.verbose)
 
+    # Allow running with no env by using defaults
     db = read_db_config(env_required=False, args=args)
     logger.info(f"DB: host={db.host} port={db.port} db={db.dbname} user={db.user}")
 
+    # Defaults tuned for TLC yellow schema
     int_like_cols = ("VendorID", "RatecodeID", "passenger_count", "payment_type")
     date_cols = ("tpep_pickup_datetime", "tpep_dropoff_datetime")
     dtype_overrides = {"store_and_fwd_flag": "string"}
@@ -532,7 +691,7 @@ def main(argv: List[str]) -> int:
     if args.csv_url and args.from_release:
         raise SystemExit("Use either --csv-url OR --from-release, not both.")
 
-    # Batch mode
+    # Batch mode (default if no --csv-url)
     if args.from_release or (not args.csv_url):
         tag = args.from_release or "yellow"
         jobs = discover_yellow_monthly_urls(
@@ -552,6 +711,7 @@ def main(argv: List[str]) -> int:
                 int_like_cols=int_like_cols,
                 date_cols=date_cols,
                 dtype_overrides=dtype_overrides,
+                month_ym=ym,
             )
             logger.info(f"Job: month={ym} csv_url={csv_url} table={cfg.table_name} load_id={cfg.load_id}")
             run_load(
@@ -560,7 +720,6 @@ def main(argv: List[str]) -> int:
                 logger=logger,
                 retries_per_chunk=args.retries_per_chunk,
                 retry_sleep_sec=args.retry_sleep_sec,
-                skip_completed=args.skip_completed,
             )
 
         logger.info("Batch complete.")
@@ -579,6 +738,7 @@ def main(argv: List[str]) -> int:
         int_like_cols=int_like_cols,
         date_cols=date_cols,
         dtype_overrides=dtype_overrides,
+        month_ym=None,
     )
 
     logger.info(f"Job: csv_url={cfg.csv_url} table={cfg.table_name} load_id={cfg.load_id}")
@@ -588,7 +748,6 @@ def main(argv: List[str]) -> int:
         logger=logger,
         retries_per_chunk=args.retries_per_chunk,
         retry_sleep_sec=args.retry_sleep_sec,
-        skip_completed=args.skip_completed,
     )
 
 

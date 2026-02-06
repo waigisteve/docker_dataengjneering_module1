@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   ny_taxi_pg:
     image: postgres:18
@@ -28,6 +26,8 @@ services:
     env_file:
       - .env
     environment:
+      - POSTGRES_HOST=ny_taxi_pg
+      - POSTGRES_PORT=5432
       - UV_PROJECT_ENVIRONMENT=/opt/venv
       - UV_PYTHON_PREFERENCE=only-system
     volumes:
@@ -37,7 +37,7 @@ services:
     command: >
       bash -c "
       cd /app &&
-      uv sync || --frozen &&
+      uv sync --frozen &&
       uv run python -u load_parquet_to_postgres.py
       "
 
@@ -49,8 +49,10 @@ services:
     env_file:
       - .env
     environment:
+      - POSTGRES_HOST=ny_taxi_pg
+      - POSTGRES_PORT=5432
       - UV_PROJECT_ENVIRONMENT=/opt/venv
-      - UV_PYTHON_PREFERENCE=only-system  
+      - UV_PYTHON_PREFERENCE=only-system
     volumes:
       - ./pipeline:/app
     depends_on:
@@ -61,9 +63,44 @@ services:
     command: >
       bash -c "
       cd /app &&
-      uv sync || --frozen &&
+      uv sync --frozen &&
       uv run jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root
       "
+
+  ingest_incremental:
+    build:
+      context: ./pipeline
+      dockerfile: Dockerfile.ingest
+    container_name: ny_taxi_ingest_incremental
+    depends_on:
+      ny_taxi_pg:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_HOST=ny_taxi_pg
+      - POSTGRES_PORT=5432
+    volumes:
+      - ./output/logs:/logs
+    restart: "no"
+    # IMPORTANT: these are only script args (ENTRYPOINT runs ingestincremental.py)
+    command:
+      - "--from-release"
+      - "yellow"
+      - "--start-month"
+      - "2019-01"
+      - "--end-month"
+      - "2021-12"
+      - "--table"
+      - "yellow_taxi_data"
+      - "--chunk-size"
+      - "50000"
+      - "--retries-per-chunk"
+      - "3"
+      - "--retry-sleep-sec"
+      - "2"
+      - "--log-file"
+      - "/logs/etl_batch.log"
 
 volumes:
   ny_taxi_data:
