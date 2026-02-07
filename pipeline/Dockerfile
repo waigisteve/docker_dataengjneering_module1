@@ -6,7 +6,7 @@ WORKDIR /app
 
 # Install system dependencies and Python packages
 RUN apt-get update && apt-get install -y gcc libpq-dev && \
-    pip install --no-cache-dir pandas sqlalchemy pyarrow psycopg2-binary && \
+    pip install --no-cache-dir pandas sqlalchemy pyarrow psycopg2-binary requests tqdm && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy the pipeline scripts into /app
@@ -14,4 +14,4 @@ RUN apt-get update && apt-get install -y gcc libpq-dev && \
 COPY . /app
 
 # Default command to run the pipeline script
-ENTRYPOINT ["python3", "-u", "load_parquet_to_postgres.py"]
+ENTRYPOINT ["python3", "-u"]

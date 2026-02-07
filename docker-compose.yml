@@ -7,22 +7,31 @@ services:
       POSTGRES_PASSWORD: root
       POSTGRES_DB: ny_taxi
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
-      - ny_taxi_data:/var/lib/postgresql/data
-
+      - ny_taxi_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d ny_taxi -h localhost -p 5432"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
   data_pipeline:
     build:
       context: ./pipeline
       dockerfile: Dockerfile
     depends_on:
       ny_taxi_pg:
-        condition: service_started
+        condition: service_healthy
     environment:
       POSTGRES_HOST: ny_taxi_pg
       POSTGRES_USER: root
       POSTGRES_PASSWORD: root
       POSTGRES_DB: ny_taxi
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: ["/app/pipeline/ingest.py"]
 
 volumes:
   ny_taxi_data:
